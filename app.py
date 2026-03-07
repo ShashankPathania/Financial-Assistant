@@ -231,7 +231,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["🏠 About", "📥 Ingest Documents", "💬 Chatbot Analysis"],
+        ["🏠 About", "📥 Ingest Documents", "💬 Chatbot Analysis", "📊 Evaluation"],
         label_visibility="collapsed",
     )
 
@@ -695,3 +695,250 @@ elif page == "💬 Chatbot Analysis":
             st.session_state.messages = []
             st.session_state.chat_history = []
             st.rerun()
+
+
+# ================================================================== #
+#  PAGE 4: EVALUATION
+# ================================================================== #
+elif page == "📊 Evaluation":
+    st.markdown("""
+    <div class="hero-header">
+        <h1>📊 RAG Pipeline Evaluation</h1>
+        <p>Measure retrieval quality with Precision, Recall, MRR and LLM-judged metrics</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Check prerequisites
+    try:
+        ce = get_chunking_engine()
+        chunk_count = ce.get_collection_count()
+        parent_count = len(ce.parent_index)
+    except Exception:
+        chunk_count = 0
+        parent_count = 0
+
+    if chunk_count == 0:
+        st.warning("⚠️ No documents ingested yet. Go to **📥 Ingest Documents** first.")
+    else:
+        st.markdown(f"**📚 Index contains {chunk_count} chunks from {parent_count} parent blocks.**")
+
+        # ---- Evaluation Controls ----
+        st.markdown("---")
+        st.markdown("### Configure Evaluation")
+
+        col_e1, col_e2, col_e3 = st.columns(3)
+        with col_e1:
+            num_queries = st.slider("Number of test queries", 2, 10, 5)
+        with col_e2:
+            k_value = st.slider("K (for P@K and R@K)", 3, 20, 5)
+        with col_e3:
+            top_n_retrieve = st.slider("Chunks to retrieve per query", 5, 20, 10)
+
+        if st.button("🚀 Run Evaluation", use_container_width=True):
+            try:
+                from src.evaluation.local_llm_evaluator import LocalLLMEvaluator
+
+                evaluator = LocalLLMEvaluator()
+                retriever = get_retriever()
+                router = get_router()
+                engine = get_chunking_engine()
+
+                # ---- Step 1: Generate test queries from ingested content ----
+                st.markdown("---")
+                status = st.status("Running evaluation pipeline...", expanded=True)
+
+                with status:
+                    st.write("🧠 Generating test queries from documents...")
+                    sample_parents = list(engine.parent_index.values())[:3]
+                    sample_text = "\n\n".join(p.get("text", "")[:1500] for p in sample_parents)
+
+                    qa_pairs = evaluator.generate_qa_pairs(sample_text, count=num_queries)
+
+                    if not qa_pairs:
+                        st.error("❌ Failed to generate test queries. Make sure Ollama is running with llama3.1:latest.")
+                        st.stop()
+
+                    st.write(f"✅ Generated {len(qa_pairs)} test queries.")
+
+                    # ---- Step 2: Run retrieval + metrics for each query ----
+                    st.write("🔍 Running retrieval and computing metrics...")
+
+                    all_retrieval_metrics = []
+                    all_generation_metrics = []
+                    per_query_details = []
+
+                    progress = st.progress(0)
+
+                    for i, qa in enumerate(qa_pairs):
+                        question = qa.get("question", "")
+                        expected = qa.get("expected_answer", "")
+                        progress.progress((i + 1) / len(qa_pairs), text=f"Query {i+1}/{len(qa_pairs)}: {question[:60]}...")
+
+                        # --- Retrieve chunks ---
+                        try:
+                            retrieval_result = retriever.retrieve(question, top_k=top_n_retrieve)
+                            retrieved_chunks = []
+                            for j, item in enumerate(retrieval_result):
+                                retrieved_chunks.append({
+                                    "id": item.get("parent_id", str(j)),
+                                    "text": item.get("child_text", "") or item.get("parent_text", ""),
+                                })
+                        except Exception as ret_err:
+                            logger.error("Retrieval failed: %s", ret_err)
+                            retrieved_chunks = []
+
+                        # --- Compute retrieval metrics (P@K, R@K, MRR) ---
+                        if retrieved_chunks:
+                            ret_metrics = evaluator.compute_retrieval_metrics(
+                                query=question,
+                                retrieved_chunks=retrieved_chunks,
+                                k=k_value,
+                            )
+                        else:
+                            ret_metrics = {"precision": 0.0, "recall": 0.0, "mrr": 0.0}
+
+                        all_retrieval_metrics.append(ret_metrics)
+
+                        # --- Run pipeline and evaluate generation quality ---
+                        try:
+                            pipeline_result = router.process_query(question)
+                            answer = pipeline_result.get("answer", "")
+                            sources = pipeline_result.get("sources", [])
+                            context = "\n".join(s.get("text_preview", "") for s in sources)
+                        except Exception:
+                            answer = "Pipeline error"
+                            context = ""
+
+                        gen_metrics = evaluator.evaluate_sample(
+                            question=question, context=context,
+                            answer=answer, expected_answer=expected,
+                        )
+                        all_generation_metrics.append(gen_metrics)
+
+                        per_query_details.append({
+                            "Query": question[:80],
+                            "P@K": ret_metrics["precision"],
+                            "R@K": ret_metrics["recall"],
+                            "MRR": ret_metrics["mrr"],
+                            "Faithfulness": gen_metrics.get("faithfulness", 0),
+                            "Relevance": gen_metrics.get("relevance", 0),
+                            "Completeness": gen_metrics.get("completeness", 0),
+                            "Clarity": gen_metrics.get("clarity", 0),
+                            "Weighted Avg": gen_metrics.get("weighted_average", 0),
+                        })
+
+                    progress.progress(1.0, text="✅ Evaluation complete!")
+                    st.write("✅ All queries evaluated.")
+
+                # ---- Step 3: Compute aggregates ----
+                avg_precision = sum(m["precision"] for m in all_retrieval_metrics) / len(all_retrieval_metrics)
+                avg_recall = sum(m["recall"] for m in all_retrieval_metrics) / len(all_retrieval_metrics)
+                avg_mrr = sum(m["mrr"] for m in all_retrieval_metrics) / len(all_retrieval_metrics)
+
+                avg_faithfulness = sum(m.get("faithfulness", 0) for m in all_generation_metrics) / len(all_generation_metrics)
+                avg_relevance = sum(m.get("relevance", 0) for m in all_generation_metrics) / len(all_generation_metrics)
+                avg_completeness = sum(m.get("completeness", 0) for m in all_generation_metrics) / len(all_generation_metrics)
+                avg_clarity = sum(m.get("clarity", 0) for m in all_generation_metrics) / len(all_generation_metrics)
+
+                # ---- Step 4: Display Score Cards ----
+                st.markdown("---")
+                st.markdown("### 📊 Retrieval Quality Metrics")
+
+                mc1, mc2, mc3 = st.columns(3)
+                with mc1:
+                    st.markdown(f"""
+                    <div class="stat-card">
+                        <div class="stat-value">{avg_precision:.2%}</div>
+                        <div class="stat-label">Precision@{k_value}</div>
+                    </div>""", unsafe_allow_html=True)
+                with mc2:
+                    st.markdown(f"""
+                    <div class="stat-card">
+                        <div class="stat-value">{avg_recall:.2%}</div>
+                        <div class="stat-label">Recall@{k_value}</div>
+                    </div>""", unsafe_allow_html=True)
+                with mc3:
+                    st.markdown(f"""
+                    <div class="stat-card">
+                        <div class="stat-value">{avg_mrr:.4f}</div>
+                        <div class="stat-label">MRR (Mean Reciprocal Rank)</div>
+                    </div>""", unsafe_allow_html=True)
+
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown("### 🧠 LLM Generation Quality (1-5 scale)")
+
+                gc1, gc2, gc3, gc4 = st.columns(4)
+                with gc1:
+                    st.markdown(f"""
+                    <div class="stat-card">
+                        <div class="stat-value">{avg_faithfulness:.1f}</div>
+                        <div class="stat-label">Faithfulness</div>
+                    </div>""", unsafe_allow_html=True)
+                with gc2:
+                    st.markdown(f"""
+                    <div class="stat-card">
+                        <div class="stat-value">{avg_relevance:.1f}</div>
+                        <div class="stat-label">Relevance</div>
+                    </div>""", unsafe_allow_html=True)
+                with gc3:
+                    st.markdown(f"""
+                    <div class="stat-card">
+                        <div class="stat-value">{avg_completeness:.1f}</div>
+                        <div class="stat-label">Completeness</div>
+                    </div>""", unsafe_allow_html=True)
+                with gc4:
+                    st.markdown(f"""
+                    <div class="stat-card">
+                        <div class="stat-value">{avg_clarity:.1f}</div>
+                        <div class="stat-label">Clarity</div>
+                    </div>""", unsafe_allow_html=True)
+
+                # ---- Step 5: Per-Query Breakdown Table ----
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown("### 📋 Per-Query Breakdown")
+
+                import pandas as pd
+                df = pd.DataFrame(per_query_details)
+                st.dataframe(
+                    df.style.format({
+                        "P@K": "{:.2%}",
+                        "R@K": "{:.2%}",
+                        "MRR": "{:.4f}",
+                        "Faithfulness": "{:.1f}",
+                        "Relevance": "{:.1f}",
+                        "Completeness": "{:.1f}",
+                        "Clarity": "{:.1f}",
+                        "Weighted Avg": "{:.2f}",
+                    }).background_gradient(
+                        subset=["P@K", "R@K", "MRR"],
+                        cmap="Greens", vmin=0, vmax=1,
+                    ).background_gradient(
+                        subset=["Faithfulness", "Relevance", "Completeness", "Clarity"],
+                        cmap="Blues", vmin=1, vmax=5,
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                # ---- Save results to session state ----
+                st.session_state["eval_results"] = {
+                    "precision": avg_precision,
+                    "recall": avg_recall,
+                    "mrr": avg_mrr,
+                    "faithfulness": avg_faithfulness,
+                    "relevance": avg_relevance,
+                    "completeness": avg_completeness,
+                    "clarity": avg_clarity,
+                    "details": per_query_details,
+                }
+
+                st.success(
+                    f"✅ Evaluation complete — "
+                    f"P@{k_value}: {avg_precision:.2%} | "
+                    f"R@{k_value}: {avg_recall:.2%} | "
+                    f"MRR: {avg_mrr:.4f}"
+                )
+
+            except Exception as e:
+                st.error(f"Evaluation failed: {e}")
+                logger.error("Evaluation error: %s", e, exc_info=True)

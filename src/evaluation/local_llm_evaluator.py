@@ -76,7 +76,7 @@ Respond with ONLY a JSON array (no markdown):
         model: str = "",
         base_url: str = "",
     ):
-        self.model = model or os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+        self.model = model or os.getenv("OLLAMA_MODEL", "llama3.1:latest")
         self.base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         self.evaluation_results: List[Dict[str, Any]] = []
 
@@ -93,13 +93,62 @@ Respond with ONLY a JSON array (no markdown):
                 messages=[{"role": "user", "content": prompt}],
                 options={
                     "temperature": temperature,
-                    "num_predict": 1000,
+                    "num_predict": 2000,
                 },
             )
-            return response["message"]["content"].strip()
+            result = response["message"]["content"].strip()
+            logger.debug("Ollama raw response (%d chars): %s", len(result), result[:200])
+            return result
         except Exception as e:
             logger.error("Ollama call failed: %s", e)
             return ""
+
+    # ------------------------------------------------------------------ #
+    #  Robust JSON Extraction
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _extract_json(text: str) -> Any:
+        """
+        Extract JSON from an LLM response that may contain markdown fences,
+        explanatory text before/after the JSON, or other noise.
+        """
+        import re
+
+        if not text or not text.strip():
+            return None
+
+        # Strategy 1: Try direct parse
+        try:
+            return json.loads(text.strip())
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: Extract from markdown code fences ```json ... ```
+        fence_match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)```", text)
+        if fence_match:
+            try:
+                return json.loads(fence_match.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 3: Find the first [ or { and match to last ] or }
+        # For arrays
+        arr_match = re.search(r"(\[[\s\S]*\])", text)
+        if arr_match:
+            try:
+                return json.loads(arr_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # For objects
+        obj_match = re.search(r"(\{[\s\S]*\})", text)
+        if obj_match:
+            try:
+                return json.loads(obj_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        return None
 
     # ------------------------------------------------------------------ #
     #  Per-Sample Evaluation
@@ -131,17 +180,12 @@ Respond with ONLY a JSON array (no markdown):
             logger.error("Empty response from Ollama for evaluation.")
             return self._default_scores(question)
 
+        scores = self._extract_json(raw_response)
+        if not scores or not isinstance(scores, dict):
+            logger.error("Failed to parse evaluation JSON.\nRaw: %s", raw_response[:500])
+            return self._default_scores(question)
+
         try:
-            # Clean up potential markdown
-            text = raw_response
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            text = text.strip()
-
-            scores = json.loads(text)
-
             # Extract numeric scores
             result = {
                 "question": question,
@@ -167,8 +211,8 @@ Respond with ONLY a JSON array (no markdown):
                         result["weighted_average"])
             return result
 
-        except json.JSONDecodeError as e:
-            logger.error("Failed to parse evaluation JSON: %s\nRaw: %s", e, raw_response[:500])
+        except Exception as e:
+            logger.error("Failed to extract scores: %s", e)
             return self._default_scores(question)
 
     def _default_scores(self, question: str) -> Dict[str, Any]:
@@ -213,6 +257,74 @@ Respond with ONLY a JSON array (no markdown):
         hits = len(top_k & relevant_set)
         return round(hits / len(relevant_set), 4)
 
+    @staticmethod
+    def mean_reciprocal_rank(
+        retrieved_ids: List[str],
+        relevant_ids: List[str],
+    ) -> float:
+        """Calculate Mean Reciprocal Rank (MRR).
+
+        Returns 1/rank of the first relevant result, or 0 if none found.
+        """
+        if not retrieved_ids or not relevant_ids:
+            return 0.0
+        relevant_set = set(relevant_ids)
+        for rank, rid in enumerate(retrieved_ids, start=1):
+            if rid in relevant_set:
+                return round(1.0 / rank, 4)
+        return 0.0
+
+    def judge_relevance(self, query: str, chunk_text: str) -> bool:
+        """Use Ollama to judge whether a retrieved chunk is relevant to the query."""
+        prompt = (
+            "You are a relevance judge. Given a user query and a retrieved text chunk, "
+            "determine if the chunk contains information relevant to answering the query.\n\n"
+            f"QUERY: {query}\n\n"
+            f"CHUNK: {chunk_text[:1500]}\n\n"
+            "Respond with ONLY 'YES' or 'NO'."
+        )
+        response = self._call_ollama(prompt, temperature=0.0)
+        return response.strip().upper().startswith("YES")
+
+    def compute_retrieval_metrics(
+        self,
+        query: str,
+        retrieved_chunks: List[Dict[str, Any]],
+        k: int = 5,
+    ) -> Dict[str, float]:
+        """
+        Compute Precision@K, Recall@K, and MRR for a single query using
+        LLM-judged relevance.
+
+        Args:
+            query: The user query.
+            retrieved_chunks: List of dicts with 'id' and 'text' keys.
+            k: Cutoff for P@K and R@K.
+
+        Returns:
+            Dict with precision, recall, mrr values.
+        """
+        all_ids = [c.get("id", str(i)) for i, c in enumerate(retrieved_chunks)]
+
+        # Judge each chunk for relevance
+        relevant_ids = []
+        for chunk in retrieved_chunks:
+            chunk_text = chunk.get("text", "")
+            chunk_id = chunk.get("id", "")
+            if self.judge_relevance(query, chunk_text):
+                relevant_ids.append(chunk_id)
+
+        precision = self.precision_at_k(all_ids, relevant_ids, k)
+        recall = self.recall_at_k(all_ids, relevant_ids, k)
+        mrr = self.mean_reciprocal_rank(all_ids, relevant_ids)
+
+        logger.info(
+            "Retrieval metrics for '%s': P@%d=%.4f, R@%d=%.4f, MRR=%.4f",
+            query[:50], k, precision, k, recall, mrr,
+        )
+        return {"precision": precision, "recall": recall, "mrr": mrr}
+
+
     # ------------------------------------------------------------------ #
     #  Auto-Generate Q/A Pairs
     # ------------------------------------------------------------------ #
@@ -231,23 +343,16 @@ Respond with ONLY a JSON array (no markdown):
         raw = self._call_ollama(prompt, temperature=0.5)
 
         if not raw:
-            logger.error("Failed to generate Q/A pairs.")
+            logger.error("Empty response from Ollama for Q/A generation.")
             return []
 
-        try:
-            text = raw
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            text = text.strip()
-
-            qa_pairs = json.loads(text)
-            logger.info("Generated %d Q/A pairs.", len(qa_pairs))
-            return qa_pairs[:count]
-        except json.JSONDecodeError as e:
-            logger.error("Failed to parse Q/A pairs JSON: %s", e)
+        qa_pairs = self._extract_json(raw)
+        if not qa_pairs or not isinstance(qa_pairs, list):
+            logger.error("Failed to parse Q/A pairs. Raw response:\n%s", raw[:500])
             return []
+
+        logger.info("Generated %d Q/A pairs.", len(qa_pairs))
+        return qa_pairs[:count]
 
     # ------------------------------------------------------------------ #
     #  Full Evaluation Run
@@ -282,7 +387,7 @@ Respond with ONLY a JSON array (no markdown):
         # Generate test cases
         qa_pairs = self.generate_qa_pairs(document_text, count=num_samples)
         if not qa_pairs:
-            return {"error": "Failed to generate Q/A pairs"}
+            return {"error": "Failed to generate Q/A pairs", "aggregated_scores": {}, "detailed_results": [], "num_samples": 0}
 
         results: List[Dict[str, Any]] = []
 

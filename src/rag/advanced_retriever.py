@@ -4,6 +4,8 @@ Advanced Retriever
 Implements HyDE (Hypothetical Document Embeddings) and Multi-Query Expansion
 using Groq, then searches ChromaDB child chunks and fetches associated parent
 chunks for broader context.  Deduplicates results by parent_id.
+
+Includes cross-encoder re-ranking for precision improvement.
 """
 
 import logging
@@ -12,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from groq import Groq
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from src.ingestion.chunking_engine import ChunkingEngine
 
@@ -20,6 +22,13 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# Minimum bi-encoder similarity to keep a candidate
+MIN_SIMILARITY_THRESHOLD = 0.30
+
+# Minimum cross-encoder score to keep a result after re-ranking
+MIN_RERANK_SCORE = 0.3
 
 
 class AdvancedRetriever:
@@ -28,8 +37,9 @@ class AdvancedRetriever:
        1. Multi-Query Expansion (Groq) — generate 3 rephrasings
        2. HyDE (Groq) — generate a hypothetical answer, embed it
        3. Search ChromaDB with all embeddings
-       4. Fetch parent chunks for broader context
-       5. De-duplicate and return ranked results
+       4. Score threshold filter (drop low-similarity noise)
+       5. Cross-encoder re-ranking for precision
+       6. Fetch parent chunks, de-duplicate, return top results
     """
 
     def __init__(
@@ -48,6 +58,16 @@ class AdvancedRetriever:
 
         # Embedding model (shared with chunking engine for consistency)
         self.embedder: SentenceTransformer = chunking_engine.embedder
+
+        # Cross-encoder re-ranker for precision improvement
+        logger.info("Loading cross-encoder re-ranker: %s", RERANKER_MODEL)
+        try:
+            self.reranker = CrossEncoder(RERANKER_MODEL, max_length=512)
+            logger.info("Cross-encoder re-ranker loaded successfully.")
+        except Exception as e:
+            logger.warning("Failed to load cross-encoder: %s — re-ranking disabled.", e)
+            self.reranker = None
+
         logger.info("AdvancedRetriever initialized (model=%s, top_k=%d)", self.groq_model, top_k)
 
     # ------------------------------------------------------------------ #
@@ -118,6 +138,46 @@ class AdvancedRetriever:
             return None
 
     # ------------------------------------------------------------------ #
+    #  Cross-Encoder Re-ranking
+    # ------------------------------------------------------------------ #
+    def _rerank(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Re-rank candidates using the cross-encoder for higher precision."""
+        if not self.reranker or not candidates:
+            return candidates
+
+        try:
+            # Build (query, child_text) pairs for the cross-encoder
+            pairs = [(query, c["child_text"]) for c in candidates]
+            scores = self.reranker.predict(pairs)
+
+            # Attach cross-encoder scores
+            for i, candidate in enumerate(candidates):
+                candidate["rerank_score"] = float(scores[i])
+
+            # Filter by minimum re-rank score and sort descending
+            filtered = [c for c in candidates if c["rerank_score"] > MIN_RERANK_SCORE]
+
+            # If filtering removed everything, keep at least top 3
+            if not filtered and candidates:
+                filtered = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)[:3]
+
+            filtered.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+            logger.info(
+                "Re-ranking: %d → %d candidates (kept those above %.2f score).",
+                len(candidates), len(filtered), MIN_RERANK_SCORE,
+            )
+            return filtered
+
+        except Exception as e:
+            logger.error("Cross-encoder re-ranking failed: %s — returning original order.", e)
+            return candidates
+
+    # ------------------------------------------------------------------ #
     #  Core Retrieval
     # ------------------------------------------------------------------ #
     def retrieve(
@@ -176,14 +236,30 @@ class AdvancedRetriever:
             logger.warning("No results found for query: %s", query[:100])
             return []
 
-        # Step 3: Fetch child metadata + parent chunks, deduplicate by parent_id
+        # Step 3: Apply similarity threshold to filter noise
+        before_count = len(all_child_ids)
+        all_child_ids = {
+            cid: score for cid, score in all_child_ids.items()
+            if score >= MIN_SIMILARITY_THRESHOLD
+        }
+        if len(all_child_ids) < before_count:
+            logger.info(
+                "Score threshold (%.2f): filtered %d → %d candidates.",
+                MIN_SIMILARITY_THRESHOLD, before_count, len(all_child_ids),
+            )
+
+        if not all_child_ids:
+            logger.warning("All candidates below threshold for query: %s", query[:100])
+            return []
+
+        # Step 4: Fetch child metadata + parent chunks, deduplicate by parent_id
         seen_parents: set = set()
-        results: List[Dict[str, Any]] = []
+        candidates: List[Dict[str, Any]] = []
 
         # Sort by score descending
         sorted_children = sorted(all_child_ids.items(), key=lambda x: x[1], reverse=True)
 
-        for child_id, score in sorted_children[:k * 2]:  # fetch more, then trim
+        for child_id, score in sorted_children[:k * 3]:  # fetch more for re-ranking
             try:
                 child_data = self.chunking_engine.collection.get(
                     ids=[child_id],
@@ -204,7 +280,7 @@ class AdvancedRetriever:
                 parent_data = self.chunking_engine.get_parent_by_id(parent_id)
                 parent_text = parent_data.get("text", "") if parent_data else ""
 
-                results.append({
+                candidates.append({
                     "parent_text": parent_text,
                     "child_text": child_text,
                     "source": meta.get("source", "unknown"),
@@ -218,7 +294,10 @@ class AdvancedRetriever:
             except Exception as e:
                 logger.error("Error fetching child %s: %s", child_id, e)
 
-        # Trim to top_k parents
+        # Step 5: Cross-encoder re-ranking for precision
+        results = self._rerank(query, candidates)
+
+        # Trim to top_k
         results = results[:k]
         logger.info("Retrieved %d unique parent contexts for query.", len(results))
         return results
