@@ -1,4 +1,4 @@
 tesseract-ocr
 libtesseract-dev
 poppler-utils
-libmagic1
+libmagic-dev
