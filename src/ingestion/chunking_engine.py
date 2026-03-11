@@ -12,21 +12,48 @@ import json
 import logging
 import os
 import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
+import tiktoken
 
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ #
+#  Dataclasses
+# ------------------------------------------------------------------ #
+@dataclass
+class DocumentMetadata:
+    """Comprehensive metadata for document tracking and processing"""
+    document_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    filename: str = ""
+    total_pages: int = 0
+    total_characters: int = 0
+    processing_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    quality_score: float = 0.0
+
+@dataclass
+class ChunkMetadata:
+    """Metadata for individual chunks"""
+    chunk_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    parent_document_id: str = ""
+    chunk_index: int = 0
+    token_count: int = 0
+    page_start: int = 0
+    chunk_type: str = "text"
+    semantic_score: float = 0.0
+
+# ------------------------------------------------------------------ #
 #  Defaults
 # ------------------------------------------------------------------ #
-PARENT_CHUNK_SIZE = 2000   # characters
-CHILD_CHUNK_SIZE = 500
-CHILD_OVERLAP = 50
+PARENT_CHUNK_TOKENS = 500   # tokens (approx 2000 chars)
+CHILD_CHUNK_TOKENS = 125    # tokens (approx 500 chars)
+CHILD_OVERLAP_TOKENS = 20
 COLLECTION_NAME = "finance_child_chunks"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -72,6 +99,10 @@ class ChunkingEngine:
             self.collection.count(),
         )
 
+        # Initialize tiktoken for precise LLM window chunking
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        logger.info("Tiktoken initialized for token-aware chunking.")
+
         # Load existing parent index
         self.parent_index: Dict[str, Dict[str, Any]] = self._load_parent_index()
 
@@ -98,43 +129,95 @@ class ChunkingEngine:
             logger.error("Failed to save parent index: %s", e)
 
     # ------------------------------------------------------------------ #
-    #  Text Splitting Helpers
+    #  Token-Aware Hybrid Text Chunking
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _split_text(
+    def _calculate_chunk_quality(self, text: str, token_count: int, target_tokens: int) -> float:
+        """Assess quality of extracted text based on density and OCR garbage (0.0 to 1.0)"""
+        if not text or token_count == 0:
+            return 0.0
+
+        length = len(text)
+        # Length quality score (reward blocks that actually fill the target context window)
+        length_score = 1.0 - abs(token_count - target_tokens) / target_tokens
+        length_score = max(0.0, min(1.0, length_score))
+
+        # Check for excessive special characters (indicates OCR issues)
+        special_char_ratio = sum(1 for c in text if not c.isalnum() and c not in ' .,!?;:-\"\n') / max(1, length)
+        special_char_score = 1.0 - min(special_char_ratio * 2, 0.5)
+
+        # Completeness score (does it end cleanly?)
+        completeness_score = 1.0 if text.rstrip().endswith(('.', '!', '?')) else 0.7
+
+        return (length_score + special_char_score + completeness_score) / 3
+
+    def _hybrid_chunking(
+        self,
         text: str,
-        chunk_size: int,
-        overlap: int = 0,
-    ) -> List[str]:
-        """Split text into chunks respecting sentence boundaries where possible."""
+        target_tokens: int,
+        overlap_tokens: int = 0,
+    ) -> List[Tuple[str, int]]:
+        """
+        Hybrid chunking: Uses semantic boundaries (\n\n) where possible, 
+        and falls back to character splitting mapped via tiktoken.
+        Returns List of (chunk_text, token_count).
+        """
         if not text or not text.strip():
             return []
 
-        chunks: List[str] = []
-        start = 0
-        text_len = len(text)
+        chunks: List[Tuple[str, int]] = []
+        paragraphs = text.split('\n\n')
+        
+        current_chunk = ""
+        current_tokens = 0
 
-        while start < text_len:
-            end = min(start + chunk_size, text_len)
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+                
+            p_tokens = len(self.tokenizer.encode(paragraph))
+            
+            # If paragraph itself is larger than target, flush current & hard split paragraph
+            if p_tokens > target_tokens:
+                if current_chunk:
+                    chunks.append((current_chunk.strip(), current_tokens))
+                    current_chunk = ""
+                    current_tokens = 0
+                
+                # Hard split the massive paragraph
+                start_char = 0
+                while start_char < len(paragraph):
+                    # Approx chars per token = 4. Take slightly more to be safe.
+                    end_char = min(start_char + (target_tokens * 4), len(paragraph))
+                    
+                    # Try to break at sentence boundary
+                    if end_char < len(paragraph):
+                        for sep in [". ", "? ", "! "]:
+                            last_sep = paragraph.rfind(sep, start_char + (target_tokens * 2), end_char)
+                            if last_sep != -1:
+                                end_char = last_sep + len(sep)
+                                break
+                                
+                    sub_text = paragraph[start_char:end_char].strip()
+                    sub_tokens = len(self.tokenizer.encode(sub_text))
+                    if sub_text:
+                        chunks.append((sub_text, sub_tokens))
+                        
+                    start_char = end_char - (overlap_tokens * 4) if overlap_tokens else end_char
+                    if start_char <= end_char - len(sub_text):
+                        start_char = end_char
+            
+            # Else try adding paragraph to current chunk
+            elif current_tokens + p_tokens <= target_tokens + overlap_tokens:
+                current_chunk = current_chunk + "\n\n" + paragraph if current_chunk else paragraph
+                current_tokens += p_tokens
+            else:
+                chunks.append((current_chunk.strip(), current_tokens))
+                current_chunk = paragraph
+                current_tokens = p_tokens
 
-            # Try to break at sentence boundary
-            if end < text_len:
-                # Look back from `end` for a period, newline, or semicolon
-                for sep in [".\n", ".\r", ". ", ";\n", "; ", "\n\n", "\n"]:
-                    last_sep = text.rfind(sep, start + chunk_size // 2, end)
-                    if last_sep != -1:
-                        end = last_sep + len(sep)
-                        break
-
-            chunk = text[start:end].strip()
-            if chunk:
-                chunks.append(chunk)
-
-            # Ensure start always advances to prevent infinite loops
-            new_start = end - overlap if overlap else end
-            if new_start <= start:
-                new_start = start + max(chunk_size // 2, 1)
-            start = new_start
+        if current_chunk:
+            chunks.append((current_chunk.strip(), current_tokens))
 
         return chunks
 
@@ -182,12 +265,12 @@ class ChunkingEngine:
 
         full_text = "\n\n".join(full_text_parts)
 
-        # --- 2. Create parent chunks (~2000 chars) ---
-        parent_texts = self._split_text(full_text, PARENT_CHUNK_SIZE, overlap=0)
+        # --- 2. Create parent chunks (~500 tokens) ---
+        parent_texts_with_tokens = self._hybrid_chunking(full_text, PARENT_CHUNK_TOKENS, overlap_tokens=0)
         parents_added = 0
         children_added = 0
 
-        for p_idx, parent_text in enumerate(parent_texts):
+        for p_idx, (parent_text, p_tokens) in enumerate(parent_texts_with_tokens):
             parent_id = str(uuid.uuid4())
 
             # Store parent in index
@@ -196,14 +279,22 @@ class ChunkingEngine:
                 "source": source_file,
                 "parent_index": p_idx,
                 "page_start": element_page_map[0] if element_page_map else 0,
+                "token_count": p_tokens,
             }
             parents_added += 1
 
-            # --- 3. Create child chunks (~500 chars) from parent text ---
-            child_texts = self._split_text(parent_text, CHILD_CHUNK_SIZE, CHILD_OVERLAP)
+            # --- 3. Create child chunks (~125 tokens) from parent text ---
+            child_texts_with_tokens = self._hybrid_chunking(parent_text, CHILD_CHUNK_TOKENS, CHILD_OVERLAP_TOKENS)
 
-            for c_idx, child_text in enumerate(child_texts):
+            for c_idx, (child_text, c_tokens) in enumerate(child_texts_with_tokens):
                 child_id = str(uuid.uuid4())
+                quality_score = self._calculate_chunk_quality(child_text, c_tokens, CHILD_CHUNK_TOKENS)
+                
+                # Drop completely garbage OCR chunks
+                if quality_score < 0.2:
+                    logger.debug("Skipping child chunk %s due to low quality score %.2f", child_id, quality_score)
+                    continue
+
                 self._upsert_child(
                     child_id=child_id,
                     parent_id=parent_id,
@@ -212,6 +303,8 @@ class ChunkingEngine:
                     child_index=c_idx,
                     chunk_type="text",
                     page=element_page_map[0] if element_page_map else 0,
+                    token_count=c_tokens,
+                    semantic_score=quality_score
                 )
                 children_added += 1
 
@@ -219,6 +312,8 @@ class ChunkingEngine:
         for vs in vision_summaries:
             parent_id = self._find_nearest_parent(vs["page"])
             child_id = str(uuid.uuid4())
+            vs_tokens = len(self.tokenizer.encode(vs["summary"]))
+            
             self._upsert_child(
                 child_id=child_id,
                 parent_id=parent_id,
@@ -228,6 +323,8 @@ class ChunkingEngine:
                 chunk_type=vs["type"],
                 page=vs["page"],
                 image_path=vs.get("image_path", ""),
+                token_count=vs_tokens,
+                semantic_score=0.9  # Vision summaries are generated, so high quality
             )
             children_added += 1
 
@@ -253,6 +350,8 @@ class ChunkingEngine:
         child_index: int,
         chunk_type: str,
         page: int,
+        token_count: int = 0,
+        semantic_score: float = 0.0,
         image_path: str = "",
     ) -> None:
         """Embed a child chunk and upsert into ChromaDB."""
@@ -264,6 +363,8 @@ class ChunkingEngine:
                 "child_index": child_index,
                 "chunk_type": chunk_type,
                 "page": page,
+                "token_count": token_count,
+                "semantic_score": semantic_score,
                 "image_path": image_path,
             }
             self.collection.upsert(
@@ -301,6 +402,17 @@ class ChunkingEngine:
     def get_collection_count(self) -> int:
         """Return the number of child chunks in ChromaDB."""
         return self.collection.count()
+
+    def get_all_children(self) -> Dict[str, Any]:
+        """Fetch all child chunks from ChromaDB for BM25 initialization."""
+        count = self.get_collection_count()
+        if count == 0:
+            return {"ids": [], "documents": [], "metadatas": []}
+            
+        return self.collection.get(
+            include=["documents", "metadatas"],
+            limit=count
+        )
 
     def query_children(
         self,

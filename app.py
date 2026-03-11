@@ -436,35 +436,77 @@ elif page == "📥 Ingest Documents":
 
     # ---- Tab 1: Web Scraper ----
     with tab1:
-        st.markdown("#### Scrape Financial PDFs")
+        st.markdown("#### Scrape Financial Documents")
         st.info(
-            "Enter a company ticker and year to search SEC EDGAR for filings. "
-            "Requires `playwright install chromium` to be run once."
+            "Download filings from international financial portals or any direct URL."
         )
 
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            scrape_ticker = st.text_input("Ticker Symbol", value="AAPL", placeholder="AAPL")
-        with col_b:
-            scrape_year = st.text_input("Filing Year", value="2024", placeholder="2024")
-        with col_c:
-            scrape_type = st.selectbox("Report Type", ["10-K", "10-Q", "8-K", "annual-report"])
+        # Portal selection
+        portal_options = {
+            "🇺🇸 SEC EDGAR (US)": "SEC_EDGAR",
+            "🇬🇧 Companies House (UK)": "COMPANIES_HOUSE",
+            "🇮🇳 BSE India": "BSE_INDIA",
+            "🔗 Direct URL Download": "DIRECT_URL",
+        }
+        selected_portal_label = st.selectbox("Select Portal", list(portal_options.keys()))
+        selected_portal = portal_options[selected_portal_label]
 
-        custom_url = st.text_input("Custom URL (optional — overrides portal search)", value="")
+        # Dynamic input fields based on portal
+        scrape_ticker = ""
+        scrape_year = ""
+        scrape_type = "10-K"
+        custom_url = ""
+        company_number = ""
+
+        if selected_portal == "SEC_EDGAR":
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                scrape_ticker = st.text_input("Ticker Symbol", value="AAPL", placeholder="AAPL")
+            with col_b:
+                scrape_year = st.text_input("Filing Year", value="2024", placeholder="2024")
+            with col_c:
+                scrape_type = st.selectbox("Report Type", ["10-K", "10-Q", "8-K"])
+
+        elif selected_portal == "COMPANIES_HOUSE":
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                scrape_ticker = st.text_input("Company Name", value="", placeholder="Vodafone Group")
+            with col_b:
+                company_number = st.text_input("Company Number (optional)", value="", placeholder="01833679")
+            with col_c:
+                scrape_year = st.text_input("Filing Year", value="2024", placeholder="2024")
+            st.caption("💡 Free API key from [Companies House Developer](https://developer.company-information.service.gov.uk). Set `COMPANIES_HOUSE_API_KEY` in `.env`.")
+
+        elif selected_portal == "BSE_INDIA":
+            col_a, col_b = st.columns(2)
+            with col_a:
+                scrape_ticker = st.text_input("Company Name / Scrip Code", value="", placeholder="Reliance Industries")
+            with col_b:
+                scrape_year = st.text_input("Year", value="2024", placeholder="2024")
+
+        elif selected_portal == "DIRECT_URL":
+            custom_url = st.text_input(
+                "📎 Paste any URL to a PDF or HTML filing",
+                value="",
+                placeholder="https://example.com/annual-report-2024.pdf",
+            )
+            scrape_ticker = st.text_input("Label (for filename)", value="company", placeholder="company_name")
 
         if st.button("🚀 Start Scraping", use_container_width=True):
-            with st.spinner("Launching Playwright browser..."):
+            with st.spinner(f"Downloading from {selected_portal_label}..."):
                 try:
                     from src.scraper.financial_scraper import scrape_financial_pdfs
-                    progress = st.progress(0, text="Navigating to financial portal...")
+                    progress = st.progress(0, text=f"Connecting to {selected_portal_label}...")
 
                     files = scrape_financial_pdfs(
                         ticker=scrape_ticker,
                         year=scrape_year,
                         report_type=scrape_type,
+                        portal=selected_portal,
                         custom_url=custom_url,
+                        company_number=company_number,
                     )
-                    progress.progress(50, text=f"Downloaded {len(files)} PDF(s). Starting ingestion...")
+                    progress.progress(50, text=f"Downloaded {len(files)} file(s). Starting ingestion...")
 
                     if files:
                         parser = get_parser()
@@ -749,8 +791,26 @@ elif page == "📊 Evaluation":
 
                 with status:
                     st.write("🧠 Generating test queries from documents...")
-                    sample_parents = list(engine.parent_index.values())[:3]
-                    sample_text = "\n\n".join(p.get("text", "")[:1500] for p in sample_parents)
+
+                    # Sample parents evenly across ALL sources (1 random chunk per source)
+                    import random
+                    from collections import defaultdict
+                    sources_map = defaultdict(list)
+                    for p in engine.parent_index.values():
+                        sources_map[p.get("source", "unknown")].append(p)
+
+                    sample_parents = []
+                    for source, parents in sources_map.items():
+                        if parents:
+                            sample_parents.append(random.choice(parents))
+
+                    # Shuffle to distribute representation
+                    random.shuffle(sample_parents)
+
+                    st.write(f"📚 Sampling from {len(sources_map)} source(s): {', '.join(sources_map.keys())}")
+                    
+                    # Take up to 4 sources, 1000 chars each to fit Ollama's 4000 char prompt limit
+                    sample_text = "\n\n".join(p.get("text", "")[:1000] for p in sample_parents[:4])
 
                     qa_pairs = evaluator.generate_qa_pairs(sample_text, count=num_queries)
 

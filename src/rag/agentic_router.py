@@ -39,7 +39,7 @@ class AgenticRouter:
 
 Respond with a JSON object (and ONLY JSON, no markdown):
 {{
-    "route": "A" or "B",
+    "route": "A", "B", or "C",
     "reasoning": "brief explanation",
     "ticker": "stock ticker if mentioned, else null",
     "date_start": "YYYY-MM-DD or null",
@@ -55,8 +55,24 @@ trading volume, market trends, or requires combining document info with market d
 Examples: "How did the stock react to Q3 results?", "What's the stock performance since the annual report?",
 "Compare the revenue growth with stock returns."
 
+Route C (Conversational/Greeting): The query is a simple greeting, pleasantry, conversational remark, or a direct question about who you are.
+Examples: "hello", "hi", "how are you?", "thanks that was helpful"
+
 If a ticker is mentioned or implied, extract it. If dates are mentioned, extract the range.
 If no dates are mentioned but market data is needed, use the last 6 months.
+
+User Query: {query}"""
+
+    AMBIGUITY_PROMPT = """You are a financial query analyzer.
+Analyze the user's query and determine if it requires a specific company name or document context to be answered accurately. 
+Generic financial questions (e.g., "What is EBITDA?", "How do SEC filings work?") DO NOT require a company name.
+Specific performance data questions (e.g., "What was the Q3 profit?", "Who is the CEO?", "What are the core risks?") DO require a company name.
+
+Respond ONLY with a JSON object:
+{{
+    "needs_company": true or false,
+    "reasoning": "brief explanation"
+}}
 
 User Query: {query}"""
 
@@ -67,6 +83,7 @@ INSTRUCTIONS:
 - Base your answer STRICTLY on the provided context
 - If market data is available, integrate it with document findings
 - Use specific numbers, dates, and facts from the context
+- If the context contains OCR or vision references like "Text extracted from image", carefully read the pipe (|) delimited values as tabular data to find numerical answers
 - If the context doesn't contain enough information, say so clearly
 - Structure your response with clear sections when appropriate
 - Be concise but thorough
@@ -95,27 +112,62 @@ PROFESSIONAL ANALYSIS:"""
 
         logger.info("AgenticRouter initialized (model=%s)", self.groq_model)
 
+    def _call_ollama_fallback(self, prompt: str, is_json: bool = False, max_tokens: int = 2000) -> str:
+        """Fallback to local Ollama instance if Groq fails."""
+        import requests
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/") + "/api/generate"
+        ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+        
+        try:
+            logger.info("Calling local Ollama model: %s", ollama_model)
+            payload = {
+                "model": ollama_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1 if is_json else 0.3,
+                    "num_predict": max_tokens
+                }
+            }
+            if is_json:
+                payload["format"] = "json"
+                
+            response = requests.post(ollama_url, json=payload, timeout=60)
+            response.raise_for_status()
+            
+            return response.json().get("response", "").strip()
+        except Exception as e:
+            logger.error("Ollama fallback failed: %s", e)
+            return ""
+
     # ------------------------------------------------------------------ #
     #  Query Classification
     # ------------------------------------------------------------------ #
     def classify_query(self, query: str) -> Dict[str, Any]:
-        """Use Groq to classify the query into Route A or Route B."""
-        if not self.groq_client:
-            logger.warning("Groq client unavailable — defaulting to Route A.")
-            return {"route": "A", "reasoning": "Groq unavailable", "ticker": None,
-                    "date_start": None, "date_end": None}
+        """Use Groq to classify the query into Route A or Route B, with Ollama fallback."""
+        prompt = self.ROUTE_CLASSIFICATION_PROMPT.format(query=query)
+        text = ""
+
+        if self.groq_client:
+            try:
+                response = self.groq_client.chat.completions.create(
+                    model=self.groq_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=300,
+                    timeout=15,
+                )
+                text = response.choices[0].message.content.strip()
+            except Exception as e:
+                logger.warning("Groq classification failed: %s", e)
+
+        if not text:
+            text = self._call_ollama_fallback(prompt, is_json=True, max_tokens=300)
+
+        if not text:
+            return {"route": "A", "reasoning": "All LLMs failed", "ticker": None, "date_start": None, "date_end": None}
 
         try:
-            prompt = self.ROUTE_CLASSIFICATION_PROMPT.format(query=query)
-            response = self.groq_client.chat.completions.create(
-                model=self.groq_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=300,
-                timeout=15,
-            )
-
-            text = response.choices[0].message.content.strip()
             # Clean up potential markdown wrapping
             if text.startswith("```"):
                 text = text.split("```")[1]
@@ -136,6 +188,26 @@ PROFESSIONAL ANALYSIS:"""
             logger.error("Query classification failed: %s", e)
             return {"route": "A", "reasoning": str(e), "ticker": None,
                     "date_start": None, "date_end": None}
+
+    def _get_available_companies(self) -> List[str]:
+        """Read parent_index.json to see what companies/documents we have."""
+        try:
+            parent_index_path = "data/chromadb_store/parent_index.json"
+            if not os.path.exists(parent_index_path):
+                return []
+                
+            with open(parent_index_path, "r") as f:
+                index = json.load(f)
+                
+            # Extract unique source filenames
+            sources = set()
+            for doc in index.values():
+                if "source" in doc:
+                    sources.add(doc["source"])
+            return list(sources)
+        except Exception as e:
+            logger.error("Failed to read available companies: %s", e)
+            return []
 
     # ------------------------------------------------------------------ #
     #  yfinance Market Data
@@ -235,15 +307,17 @@ PROFESSIONAL ANALYSIS:"""
             dict with 'answer', 'route', 'sources', 'market_data', 'images'
         """
         # --- Step 1: Security Validation ---
-        is_safe, sanitized_query = self.security_manager.validate_input(query)
-        if not is_safe:
+        validation = self.security_manager.validate_user_input(query)
+        if not validation.is_safe:
             return {
-                "answer": sanitized_query,  # error message
+                "answer": validation.sanitized_input,  # error message
                 "route": "BLOCKED",
                 "sources": [],
                 "market_data": {},
                 "images": [],
             }
+            
+        sanitized_query = validation.sanitized_input
 
         # --- Step 2: Classify Query ---
         classification = self.classify_query(sanitized_query)
@@ -252,12 +326,91 @@ PROFESSIONAL ANALYSIS:"""
         date_start = classification.get("date_start")
         date_end = classification.get("date_end")
 
-        # --- Step 3: Retrieve Documents ---
+        # --- Step 2b: Ambiguity / Clarification Guardrail ---
+        # If it's not conversational and no ticker is provided, check if it needs one
+        if route in ["A", "B"] and not ticker:
+            ambiguity_prompt = self.AMBIGUITY_PROMPT.format(query=sanitized_query)
+            text = ""
+            
+            if self.groq_client:
+                try:
+                    response = self.groq_client.chat.completions.create(
+                        model=self.groq_model,
+                        messages=[{"role": "user", "content": ambiguity_prompt}],
+                        temperature=0.1,
+                        max_tokens=100,
+                    )
+                    text = response.choices[0].message.content.strip()
+                except Exception as e:
+                    logger.warning("Groq ambiguity check failed: %s", e)
+                    
+            if not text:
+                text = self._call_ollama_fallback(ambiguity_prompt, is_json=True, max_tokens=100)
+                
+            if text:
+                try:
+                    if text.startswith("```"):
+                        text = text.split("```")[1]
+                        if text.startswith("json"):
+                            text = text[4:]
+                    
+                    ambiguity = json.loads(text.strip())
+                    
+                    # If it needs a company but doesn't have one, ask for clarification!
+                    if ambiguity.get("needs_company"):
+                        available_docs = self._get_available_companies()
+                        
+                        if available_docs:
+                            doc_list = "\n".join([f"- {doc}" for doc in available_docs])
+                            clarification = (
+                                 "It looks like you are asking about specific financial data, but you didn't mention which company. "
+                                 f"I currently have documents loaded for the following:\n\n{doc_list}\n\n"
+                                 "Which one would you like me to analyze?"
+                            )
+                        else:
+                            clarification = "It looks like you are asking about specific financial data, but I don't see a company name in your query, and my document database is currently empty!"
+                        
+                        return {
+                            "answer": clarification,
+                            "route": "CLARIFICATION",
+                            "route_reasoning": ambiguity.get("reasoning", "Ambiguous query lacking company name."),
+                            "sources": [],
+                            "market_data": {},
+                            "images": []
+                        }
+                except Exception as e:
+                    logger.error("Ambiguity check parsing failed: %s", e)
+                    # Fallback to proceed as normal if check fails
+                    pass
+
+        # --- Step 3: Handle Conversational Route ---
+        if route == "C":
+            return {
+                "answer": "Hello! I am your Financial Analyst Copilot. I can help you analyze corporate documents like 10-Ks and look up historical market data. How can I help you today?",
+                "route": "C",
+                "route_reasoning": classification.get("reasoning", ""),
+                "sources": [],
+                "market_data": {},
+                "images": [],
+            }
+
+        # --- Step 4: Retrieve Documents ---
         retrieval_results = self.retriever.retrieve(sanitized_query, top_k=5)
+        
+        # --- Step 4b: Empty Results Fallback ---
+        if route == "A" and not retrieval_results:
+            return {
+                "answer": "I could not find any relevant information in the ingested documents to answer your question.",
+                "route": "A",
+                "route_reasoning": "No relevant context found above similarity threshold.",
+                "sources": [],
+                "market_data": {},
+                "images": [],
+            }
 
         # Sanitize retrieved contexts
         document_texts = [r.get("parent_text", r.get("child_text", "")) for r in retrieval_results]
-        sanitized_contexts = self.security_manager.sanitize_context(document_texts)
+        sanitized_contexts = self.security_manager.sanitize_context_chunks(document_texts)
         document_context = "\n\n---\n\n".join(
             f"[Source: {r.get('source', 'unknown')}, Page {r.get('page', '?')}]\n{ctx}"
             for r, ctx in zip(retrieval_results, sanitized_contexts)
@@ -280,15 +433,24 @@ PROFESSIONAL ANALYSIS:"""
                 market_context_str = f"MARKET DATA CONTEXT:\n{market_context_str}"
 
         # --- Step 4: Generate Response ---
-        answer = self._generate_response(
-            query=sanitized_query,
+        secure_prompt = self.security_manager.create_secure_prompt(
+            user_query=sanitized_query,
             document_context=document_context or "No relevant documents found in the knowledge base.",
-            market_context=market_context_str,
+            market_context=market_context_str
+        )
+        
+        answer = self._generate_response(
+            secure_prompt=secure_prompt,
             chat_history=chat_history,
         )
 
-        # Output sanitization
-        answer = self.security_manager.sanitize_output(answer)
+        # Output Validation and Sanitization
+        is_safe_response = self.security_manager.validate_response(answer)
+        if not is_safe_response:
+             logger.warning("Generation output blocked by security validator.")
+             answer = "I cannot fulfill that request or output this response due to safety restrictions."
+        else:
+             answer = self.security_manager.sanitize_output(answer)
 
         # Build sources list
         sources = [
@@ -316,24 +478,10 @@ PROFESSIONAL ANALYSIS:"""
     # ------------------------------------------------------------------ #
     def _generate_response(
         self,
-        query: str,
-        document_context: str,
-        market_context: str = "",
+        secure_prompt: str,
         chat_history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
-        """Generate the final response using Groq."""
-        if not self.groq_client:
-            return (
-                "⚠️ Groq API key is not configured. Please set GROQ_API_KEY in your .env file.\n\n"
-                f"Retrieved {len(document_context)} chars of document context for your query."
-            )
-
-        prompt = self.GENERATION_PROMPT.format(
-            query=query,
-            document_context=document_context,
-            market_context=market_context,
-        )
-
+        """Generate the final response using Groq, fallback to Ollama."""
         messages: List[Dict[str, str]] = []
 
         # Include chat history for conversational context
@@ -341,20 +489,35 @@ PROFESSIONAL ANALYSIS:"""
             for msg in chat_history[-6:]:  # last 3 turns
                 messages.append(msg)
 
-        messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "user", "content": secure_prompt})
+        
+        answer = ""
 
-        try:
-            response = self.groq_client.chat.completions.create(
-                model=self.groq_model,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=2000,
-                timeout=30,
-            )
-            answer = response.choices[0].message.content.strip()
-            logger.info("Response generated (%d chars).", len(answer))
-            return answer
+        if self.groq_client:
+            try:
+                response = self.groq_client.chat.completions.create(
+                    model=self.groq_model,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=2000,
+                    timeout=30,
+                )
+                answer = response.choices[0].message.content.strip()
+                logger.info("Response generated via Groq (%d chars).", len(answer))
+            except Exception as e:
+                logger.error("Groq generation failed: %s", e)
+                
+        if not answer:
+            # Reconstruct prompt for completion since Ollama generate API takes string
+            ollama_prompt = ""
+            for msg in messages:
+                ollama_prompt += f"{msg['role'].upper()}: {msg['content']}\n\n"
+            
+            answer = self._call_ollama_fallback(ollama_prompt.strip(), is_json=False, max_tokens=2000)
+            if answer:
+                logger.info("Response generated via Ollama (%d chars).", len(answer))
 
-        except Exception as e:
-            logger.error("Generation failed: %s", e)
-            return f"⚠️ Generation error: {str(e)}. Please try again."
+        if not answer:
+            return "⚠️ Generation error: Both Groq and Local Fallback failed to return a response."
+            
+        return answer

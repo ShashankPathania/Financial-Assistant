@@ -168,18 +168,124 @@ def main():
     with open(args_file, "r") as f:
         args = json.load(f)
 
-    # Run with a fresh ProactorEventLoop on Windows
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
     try:
-        files = asyncio.run(run_scrape(args))
+        portal = args.get("portal", "")
+        if portal == "BSE_INDIA":
+            files = asyncio.run(run_bse_scrape(args))
+        else:
+            files = asyncio.run(run_scrape(args))
     except Exception as e:
         logger.error("Scraping failed: %s", e, exc_info=True)
         files = []
 
     with open(output_file, "w") as f:
         json.dump(files, f)
+
+
+async def run_bse_scrape(args: dict) -> List[str]:
+    """Specialized Playwright flow for BSE India to evade bot protection."""
+    from playwright.async_api import async_playwright
+    import re
+
+    output_dir = args["output_dir"]
+    company_name = args["ticker"]  # Actually company name for BSE
+    year = args["year"]
+    max_downloads = args.get("max_downloads", 5)
+    headless = args.get("headless", True)
+
+    downloaded_files: List[str] = []
+
+    async with async_playwright() as p:
+        # Force non-headless for BSE to bypass bot protection challenges locally.
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            accept_downloads=True,
+        )
+        page = await context.new_page()
+
+        # 1. Visit homepage to get cookies/clear clearance
+        logger.info("BSE Playwright: Visiting homepage for cookies...")
+        await page.goto("https://www.bseindia.com/", wait_until="domcontentloaded", timeout=30000)
+        # Wait 3 seconds to let Akamai/Cloudflare bot challenge complete if headed
+        await page.wait_for_timeout(3000)
+
+        # 2. Search API
+        search_url = f"https://api.bseindia.com/BseIndiaAPI/api/Suggest/v1/SuggestScrip?Type=equity&text={company_name}"
+        logger.info("BSE Playwright: Searching %s", search_url)
+        resp = await page.goto(search_url)
+        text = str(await resp.text()).strip()
+
+        if not text or text.startswith("<!DOCTYPE"):
+            logger.error("BSE Playwright: Blocked at search step.")
+            await browser.close()
+            return []
+
+        entries = text.split(",")
+        if not entries or len(entries[0].split("/")) < 2:
+            logger.error("BSE Playwright: No scrip found.")
+            await browser.close()
+            return []
+
+        scrip_code = entries[0].split("/")[0].strip()
+        resolved_name = entries[0].split("/")[1].strip()
+        logger.info("BSE Playwright: Found Scrip %s (%s)", scrip_code, resolved_name)
+
+        # 3. Reports API
+        reports_url = f"https://api.bseindia.com/BseIndiaAPI/api/AnnualReport/w?scripcode={scrip_code}&flag="
+        resp = await page.goto(reports_url)
+        
+        try:
+            reports = await resp.json()
+        except:
+            logger.error("BSE Playwright: Failed to parse reports JSON.")
+            await browser.close()
+            return []
+
+        # 4. Filter & Download
+        for report in reports:
+            if len(downloaded_files) >= max_downloads:
+                break
+            
+            report_year = str(report.get("YEAR", ""))
+            if year and year not in report_year:
+                continue
+
+            pdf_path = report.get("ATTACH_PATH", "")
+            if not pdf_path:
+                continue
+
+            if not pdf_path.startswith("http"):
+                pdf_path = f"https://www.bseindia.com{pdf_path}"
+
+            safe_name = re.sub(r"[^a-zA-Z0-9]", "_", resolved_name)[:30]
+            filename = f"BSE_{safe_name}_{report_year}_annual_report.pdf"
+            filepath = os.path.join(output_dir, filename)
+
+            if os.path.exists(filepath):
+                downloaded_files.append(filepath)
+                continue
+
+            logger.info("BSE Playwright: Downloading PDF %s", pdf_path)
+            try:
+                # Use page.goto to download stream natively within context
+                dl_resp = await page.goto(pdf_path, timeout=30000)
+                if dl_resp:
+                    content = await dl_resp.body()
+                    if b"%PDF" in content[:100]:
+                        with open(filepath, "wb") as f:
+                            f.write(content)
+                        downloaded_files.append(filepath)
+                        logger.info("BSE Playwright: Saved %s", filename)
+            except Exception as e:
+                logger.error("BSE Playwright: PDF DL error: %s", e)
+
+        await browser.close()
+
+    return downloaded_files
 
 
 if __name__ == "__main__":
