@@ -12,6 +12,7 @@ sentence-transformers>=2.2.2
 groq>=0.4.0
 ollama>=0.1.6
 rank-bm25>=0.2.2
+pysqlite3-binary>=0.5.2
 
 playwright>=1.40.0
 
