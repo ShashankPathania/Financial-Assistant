@@ -78,6 +78,7 @@ Respond with ONLY a JSON array (no markdown):
     ):
         self.model = model or os.getenv("OLLAMA_MODEL", "llama3.1:latest")
         self.base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        self.client = ollama_client.Client(host=self.base_url)
         self.evaluation_results: List[Dict[str, Any]] = []
 
         logger.info("LocalLLMEvaluator initialized (model=%s, base_url=%s)", self.model, self.base_url)
@@ -88,7 +89,7 @@ Respond with ONLY a JSON array (no markdown):
     def _call_ollama(self, prompt: str, temperature: float = 0.3) -> str:
         """Call the local Ollama instance."""
         try:
-            response = ollama_client.chat(
+            response = self.client.chat(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 options={

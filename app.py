@@ -780,6 +780,15 @@ elif page == "📊 Evaluation":
             try:
                 from src.evaluation.local_llm_evaluator import LocalLLMEvaluator
 
+                # Check if Ollama is reachable before instantiating the evaluator
+                import requests
+                try:
+                    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+                    requests.get(f"{ollama_base_url}/api/tags", timeout=2)
+                except requests.RequestException:
+                    st.error("⚠️ Ollama is not reachable. The local evaluator requires a running Ollama instance (which cannot run on Streamlit Community Cloud).")
+                    st.stop()
+
                 evaluator = LocalLLMEvaluator()
                 retriever = get_retriever()
                 router = get_router()
